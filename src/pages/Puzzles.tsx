@@ -1,4 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import Md from '../components/Md';
+import { explainPuzzle } from '../chess/explain';
+import { checkMove } from '../chess/coach';
+import { PIECE_NAME } from '../chess/tactics';
 import { Chess } from 'chess.js';
 import type { Color, Square } from 'chess.js';
 import PlayableBoard from '../components/PlayableBoard';
@@ -41,26 +45,39 @@ export default function Puzzles() {
 interface SolverProps {
   puzzle: Puzzle;
   onResult: (solved: boolean, usedHint: boolean) => void;
-  /** in rush mode a wrong move ends the puzzle immediately */
+  /** in rush mode a wrong move ends the puzzle immediately and explanations are skipped */
   strict?: boolean;
   showSolutionOnFail?: boolean;
+  /** cards shown in the side column above the explanation */
+  side?: React.ReactNode;
 }
 
 function puzzleOrientation(p: Puzzle): Color {
   return new Chess(p.fen).turn() === 'w' ? 'b' : 'w';
 }
 
-function PuzzleSolver({ puzzle, onResult, strict, showSolutionOnFail = true }: SolverProps) {
+type Msg = { tone: 'good' | 'bad' | 'info'; text: string };
+
+function PuzzleSolver({ puzzle, onResult, strict, showSolutionOnFail = true, side }: SolverProps) {
   const chessRef = useRef(new Chess(puzzle.fen));
   const [fen, setFen] = useState(puzzle.fen);
   const [idx, setIdx] = useState(0); // index into moves of the next expected move
   const [state, setState] = useState<'intro' | 'solving' | 'solved' | 'failed'>('intro');
   const [last, setLast] = useState<{ from: Square; to: Square } | null>(null);
-  const [msg, setMsg] = useState<{ tone: 'good' | 'bad' | 'info'; text: string } | null>(null);
+  const [msgs, setMsgs] = useState<Msg[]>([]);
   const [arrows, setArrows] = useState<Arrow[]>([]);
   const [hintLevel, setHintLevel] = useState(0);
+  const [viewStep, setViewStep] = useState<number | null>(null);
+  const [checking, setChecking] = useState(false);
   const failed = useRef(false);
   const orientation = puzzleOrientation(puzzle);
+  const explanation = useMemo(() => explainPuzzle(puzzle.fen, puzzle.moves), [puzzle]);
+  const stepFor = (ply: number) => explanation.steps.find((s) => s.ply === ply);
+  const say = (m: Msg) => setMsgs((xs) => [...xs, m]);
+  useEffect(() => {
+    // test-only: expose the current puzzle for automated UI tests (?test in URL)
+    if (window.location.search.includes('test')) (window as unknown as Record<string, unknown>).__puzzle = puzzle;
+  }, [puzzle]);
 
   const play = useCallback((uci: string) => {
     const c = chessRef.current;
@@ -77,60 +94,76 @@ function PuzzleSolver({ puzzle, onResult, strict, showSolutionOnFail = true }: S
       play(puzzle.moves[0]);
       setIdx(1);
       setState('solving');
-      setMsg({ tone: 'info', text: `Find the best move for ${orientation === 'w' ? 'White' : 'Black'}.` });
+      setMsgs([{ tone: 'info', text: `Find the best move for ${orientation === 'w' ? 'White' : 'Black'}.` }]);
     }, 700);
     return () => clearTimeout(t);
   }, [puzzle, play, orientation]);
 
-  const onMove = (uci: string) => {
-    if (state !== 'solving') return;
+  const onMove = async (uci: string) => {
+    if (state !== 'solving' || checking) return;
     const expected = puzzle.moves[idx];
     const isFinal = idx === puzzle.moves.length - 1;
-    const test = new Chess(chessRef.current.fen());
+    const fenBefore = chessRef.current.fen();
+    const test = new Chess(fenBefore);
     const mv = test.move({ from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] });
     const correct = uci === expected || (uci.slice(0, 4) === expected.slice(0, 4) && !expected[4]) || (isFinal && test.isCheckmate());
     if (!correct) {
       sfx.fail();
       if (!failed.current) {
         failed.current = true;
+        onResult(false, hintLevel > 0);
         if (strict) {
           setState('failed');
-          setMsg({ tone: 'bad', text: `✗ ${mv.san} isn’t it.` });
-          onResult(false, hintLevel > 0);
+          say({ tone: 'bad', text: `✗ ${mv.san} isn’t it.` });
           return;
         }
-        onResult(false, hintLevel > 0);
       }
-      setMsg({ tone: 'bad', text: `✗ ${mv.san} isn’t the solution. Try again, or show the answer.` });
+      // Ask the engine why the move doesn't work
+      setChecking(true);
+      say({ tone: 'bad', text: `✗ ${mv.san} isn’t the solution…` });
+      try {
+        const res = await checkMove(fenBefore, uci, 11);
+        const why =
+          res.severity === 'ok'
+            ? `${mv.san} is a reasonable move, but it misses the knockout blow. Look for something more forcing!`
+            : res.explanation || `${mv.san} lets them off the hook.`;
+        setMsgs((xs) => [...xs.slice(0, -1), { tone: 'bad', text: `✗ ${mv.san} isn’t it. ${why} Try again, or show the answer.` }]);
+      } finally {
+        setChecking(false);
+      }
       return;
     }
     play(uci);
     setArrows([]);
+    const why = strict ? null : stepFor(idx);
     if (isFinal) {
       setState('solved');
       sfx.success();
-      setMsg({ tone: 'good', text: failed.current ? 'Solved (after a miss).' : '✓ Solved!' });
+      say({ tone: 'good', text: `${failed.current ? 'Solved (after a miss).' : '✓ Solved!'} ${why ? why.text : ''}` });
       if (!failed.current) onResult(true, hintLevel > 0);
       return;
     }
-    setMsg({ tone: 'good', text: `✓ ${mv.san}, keep going!` });
+    say({ tone: 'good', text: `✓ ${mv.san}! ${why ? why.text : ''}` });
     const reply = puzzle.moves[idx + 1];
     setTimeout(() => {
       play(reply);
+      const r = stepFor(idx + 1);
+      if (r && !strict) say({ tone: 'info', text: r.text });
       setIdx(idx + 2);
-    }, 550);
+    }, 650);
   };
 
   const hint = () => {
     const exp = puzzle.moves[idx];
     if (hintLevel === 0) {
       setHintLevel(1);
-      const c = chessRef.current;
-      const p = c.get(exp.slice(0, 2) as Square);
-      setMsg({ tone: 'info', text: `💡 Look at your ${p ? { p: 'pawn', n: 'knight', b: 'bishop', r: 'rook', q: 'queen', k: 'king' }[p.type] : 'piece'} on ${exp.slice(0, 2)}.` });
-      setArrows([]);
-    } else {
+      say({ tone: 'info', text: `💡 ${idx === 1 ? explanation.intro.replace(/\*\*/g, '') : 'Keep looking for the most forcing move: checks, captures and threats.'}` });
+    } else if (hintLevel === 1) {
       setHintLevel(2);
+      const p = chessRef.current.get(exp.slice(0, 2) as Square);
+      say({ tone: 'info', text: `💡 Look at your ${p ? PIECE_NAME[p.type] : 'piece'} on ${exp.slice(0, 2)}.` });
+    } else {
+      setHintLevel(3);
       setArrows([{ from: exp.slice(0, 2) as Square, to: exp.slice(2, 4) as Square, color: '#35c46a' }]);
     }
   };
@@ -141,7 +174,6 @@ function PuzzleSolver({ puzzle, onResult, strict, showSolutionOnFail = true }: S
       onResult(false, true);
     }
     setState('failed');
-    // play out the rest
     let i = idx;
     const step = () => {
       if (i >= puzzle.moves.length) return;
@@ -150,30 +182,90 @@ function PuzzleSolver({ puzzle, onResult, strict, showSolutionOnFail = true }: S
       setTimeout(step, 700);
     };
     step();
-    setMsg({ tone: 'info', text: 'Here’s the solution.' });
+    say({ tone: 'info', text: 'Here’s the solution. Read “Why it works” to see the idea.' });
   };
 
-  const hintMarks = hintLevel === 1 ? [{ square: puzzle.moves[idx]?.slice(0, 2) as Square, color: '#35c46a', kind: 'ring' as const }] : [];
+  const done = state === 'solved' || state === 'failed';
+  const viewed = viewStep !== null ? explanation.steps[viewStep] : null;
+  const viewedFenBefore = viewStep === null ? null : viewStep === 0 ? explanation.fenStart : explanation.steps[viewStep - 1].fenAfter;
+  const hintMarks = hintLevel === 2 ? [{ square: puzzle.moves[idx]?.slice(0, 2) as Square, color: '#35c46a', kind: 'ring' as const }] : [];
 
   return (
-    <div className="puzzle-solver">
-      <PlayableBoard fen={fen} orientation={orientation} interactive={state === 'solving'} onMove={onMove} lastMove={last} arrows={arrows} marks={hintMarks} />
-      <div className="puzzle-bar">
-        <span className={`turn-dot ${orientation}`} /> {orientation === 'w' ? 'White' : 'Black'} to play
-        {msg && <span className={`inline-msg ${msg.tone}`}>{msg.text}</span>}
-        {!strict && state === 'solving' && (
-          <>
-            <button className="btn small" onClick={hint}>
-              💡 Hint
-            </button>
-            {showSolutionOnFail && (
-              <button className="btn small ghost" onClick={showSolution}>
-                Show answer
-              </button>
+    <div className="play-layout">
+      <div className="board-col">
+        <div className="puzzle-solver">
+          <PlayableBoard
+            fen={viewed ? viewedFenBefore! : fen}
+            orientation={orientation}
+            interactive={state === 'solving' && !checking}
+            onMove={onMove}
+            lastMove={viewed ? null : last}
+            arrows={
+              viewed
+                ? [{ from: viewed.uci.slice(0, 2) as Square, to: viewed.uci.slice(2, 4) as Square, color: viewed.mine ? '#35c46a' : '#ff8a3d' }]
+                : arrows
+            }
+            marks={viewed ? [] : hintMarks}
+          />
+          <div className="puzzle-bar">
+            <span className={`turn-dot ${orientation}`} /> {orientation === 'w' ? 'White' : 'Black'} to play
+            {!strict && state === 'solving' && (
+              <>
+                <button className="btn small" onClick={hint} disabled={hintLevel >= 3}>
+                  💡 Hint {hintLevel > 0 ? `(${hintLevel}/3)` : ''}
+                </button>
+                {showSolutionOnFail && (
+                  <button className="btn small ghost" onClick={showSolution}>
+                    Show answer
+                  </button>
+                )}
+              </>
             )}
-          </>
-        )}
+          </div>
+        </div>
       </div>
+      <aside className="side-col">
+        {side}
+        {!strict && msgs.length > 0 && !done && (
+          <div className="card coach-card">
+            <h3>Coach</h3>
+            <div className="coach-feed">
+              {[...msgs].reverse().map((m, i) => (
+                <div key={msgs.length - i} className={`coach-msg ${m.tone}`}>
+                  <Md text={m.text} />
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {strict && msgs.length > 0 && <div className={`coach-msg ${msgs[msgs.length - 1].tone}`}>{msgs[msgs.length - 1].text}</div>}
+        {done && !strict && (
+          <div className="card explain-card">
+            <h3>🧠 Why it works</h3>
+            <p className="small">
+              <Md text={explanation.intro} />
+            </p>
+            <ol className="explain-steps">
+              {explanation.steps.map((st, i) => (
+                <li key={i} className={`${st.mine ? 'mine' : 'theirs'} ${viewStep === i ? 'on' : ''}`}>
+                  <button className="linkish" onClick={() => setViewStep(viewStep === i ? null : i)}>
+                    <span className="mv-san">{st.mine ? '' : '…'}{st.san}</span>
+                    {st.tag && <span className="tag">{st.tag}</span>}
+                    <span className="small muted"> {st.mine ? '(you)' : '(them)'}</span>
+                  </button>
+                  <div className="small">
+                    <Md text={st.text} />
+                  </div>
+                </li>
+              ))}
+            </ol>
+            <div className="coach-msg good small">
+              <Md text={explanation.summary} />
+            </div>
+            <p className="small muted">Click a move to see it on the board{viewStep !== null ? ' (click again to go back)' : ''}.</p>
+          </div>
+        )}
+      </aside>
     </div>
   );
 }
@@ -198,9 +290,7 @@ function RatedPuzzles() {
 
   if (!puzzle) return <p className="muted">No puzzles match that filter yet.</p>;
   return (
-    <div className="play-layout">
-      <div className="board-col">
-        <PuzzleSolver
+    <PuzzleSolver
           key={`${puzzle.id}-${n}`}
           puzzle={puzzle}
           onResult={(solved, usedHint) => {
@@ -208,9 +298,8 @@ function RatedPuzzles() {
             const delta = recordPuzzle(puzzle.id, puzzle.rating, puzzle.themes, ok, true);
             setResult({ solved: ok, delta });
           }}
-        />
-      </div>
-      <aside className="side-col">
+        side={
+          <>
         <div className="card">
           <h3>Puzzle rating</h3>
           <div className="acc-big">{puzzleRating}</div>
@@ -253,8 +342,9 @@ function RatedPuzzles() {
           </div>
           <p className="small muted">{PUZZLES.length} puzzles in the library, generated and checked by the Stockfish engine.</p>
         </div>
-      </aside>
-    </div>
+          </>
+        }
+      />
   );
 }
 
@@ -277,18 +367,15 @@ function ReviewPuzzles() {
       </div>
     );
   return (
-    <div className="play-layout">
-      <div className="board-col">
-        <PuzzleSolver
+    <PuzzleSolver
           key={`${current.id}-${n}`}
           puzzle={current}
           onResult={(solved, usedHint) => {
             recordPuzzle(current.id, current.rating, current.themes, solved && !usedHint, false);
             setDone(true);
           }}
-        />
-      </div>
-      <aside className="side-col">
+        side={
+          <>
         <div className="card">
           <h3>Retry missed puzzles</h3>
           <p className="muted">These are puzzles you got wrong before. They don’t affect your rating.</p>
@@ -306,8 +393,9 @@ function ReviewPuzzles() {
             Next →
           </button>
         </div>
-      </aside>
-    </div>
+          </>
+        }
+      />
   );
 }
 
@@ -392,30 +480,26 @@ function PuzzleRush() {
       </div>
     );
 
+  if (!puzzle) return null;
   return (
-    <div className="play-layout">
-      <div className="board-col">
-        {puzzle && (
-          <PuzzleSolver
-            key={`${puzzle.id}-${n}`}
-            puzzle={puzzle}
-            strict
-            onResult={(solved) => {
-              if (solved) {
-                const sc = score + 1;
-                setScore(sc);
-                setTimeout(() => nextPuzzle(sc), 500);
-              } else {
-                const st = strikes + 1;
-                setStrikes(st);
-                if (st >= 3) setTimeout(() => end(score), 600);
-                else setTimeout(() => nextPuzzle(score), 900);
-              }
-            }}
-          />
-        )}
-      </div>
-      <aside className="side-col">
+    <PuzzleSolver
+      key={`${puzzle.id}-${n}`}
+      puzzle={puzzle}
+      strict
+      onResult={(solved) => {
+        if (solved) {
+          const sc = score + 1;
+          setScore(sc);
+          setTimeout(() => nextPuzzle(sc), 500);
+        } else {
+          const st = strikes + 1;
+          setStrikes(st);
+          if (st >= 3) setTimeout(() => end(score), 600);
+          else setTimeout(() => nextPuzzle(score), 900);
+        }
+      }}
+      side={
+
         <div className="card">
           <div className="rush-stats">
             <div>
@@ -437,7 +521,7 @@ function PuzzleRush() {
             Stop
           </button>
         </div>
-      </aside>
-    </div>
+      }
+    />
   );
 }
