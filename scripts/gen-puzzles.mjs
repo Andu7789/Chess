@@ -9,10 +9,14 @@ import { detectMotifs, materialCount } from '../src/chess/tactics.ts';
 
 const [, , outFile = 'puzzles.jsonl', targetArg = '100', seedArg = '1'] = process.argv;
 const target = Number(targetArg);
-let seed = Number(seedArg) * 9301 + 49297;
+// mulberry32: small, decent-quality seeded PRNG
+let seed = (Number(seedArg) * 2654435761) >>> 0;
 const rand = () => {
-  seed = (seed * 9301 + 49297) % 233280;
-  return seed / 233280;
+  seed = (seed + 0x6d2b79f5) >>> 0;
+  let t = seed;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 };
 
 const engine = await createEngine();
@@ -80,6 +84,11 @@ function rate({ mateIn, playerMoves, firstIsForcing, shallowFinds, themes }) {
 
 async function pickMove(fen, ply) {
   // Opening: random among decent moves. Later: mostly good, sometimes a slip.
+  if (ply < 2) {
+    // fully random first moves give every game a different opening
+    const legal = new Chess(fen).moves({ verbose: true });
+    return legal[Math.floor(rand() * legal.length)].lan;
+  }
   if (ply < 8) {
     const a = await engine.analyse(fen, { depth: 6, multipv: 4 });
     const ok = a.lines.filter((l) => toCp(l.score) > toCp(a.lines[0].score) - 60);
