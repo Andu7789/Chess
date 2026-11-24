@@ -1405,6 +1405,15 @@ main {
   .nav-label {
     display: none;
   }
+  nav {
+    order: 3;
+    flex: 1 1 100%;
+    flex-wrap: nowrap;
+    justify-content: space-between;
+  }
+  .brand {
+    flex: 1;
+  }
   .hero-stats {
     gap: 1rem;
   }

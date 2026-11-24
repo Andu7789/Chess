@@ -42,7 +42,7 @@ export default function App() {
       page = <Lessons />;
       break;
     case 'lesson':
-      page = <LessonPlayer lessonId={param ?? ''} />;
+      page = <LessonPlayer key={param} lessonId={param ?? ''} />;
       break;
     case 'puzzles':
       page = <Puzzles />;
